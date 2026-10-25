@@ -252,27 +252,45 @@ def render():
         st.markdown('<div class="card-title">Node Location</div><div class="card-sub">Resolved from the latest stored GPS coordinates</div>', unsafe_allow_html=True)
         if lat_col and lon_col and pd.notna(latest.get(lat_col)) and pd.notna(latest.get(lon_col)):
             lat, lon = float(latest[lat_col]), float(latest[lon_col])
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                st.warning("GPS location unavailable — received coordinates are invalid.")
+            elif abs(lat) < 1e-6 and abs(lon) < 1e-6:
+                # Many GPS modules report 0,0 before acquiring a valid satellite fix.
+                st.warning("GPS fix not acquired — coordinates are 0.000000, 0.000000. The receiver may not have locked onto enough satellites for a valid position fix. Check the GPS antenna connection, satellite visibility, and receiver fix status.")
+            else:
                 place = reverse_geocode(round(lat, 4), round(lon, 4))
                 st.write(place)
                 st.caption(f"Latitude: {lat:.6f} · Longitude: {lon:.6f}")
                 st.markdown(f"[Open coordinates in OpenStreetMap](https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}#map=17/{lat:.6f}/{lon:.6f})")
-            else:
-                st.warning("Stored coordinates are outside valid latitude/longitude ranges.")
         else:
             st.warning("GPS location unavailable — no valid coordinates received. The GPS module may still be acquiring a satellite fix or the latest telemetry may not include latitude/longitude.")
+
     # KPI row. Invalid readings are displayed as unavailable, not interpreted as normal.
-    c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
     def num_or_none(value):
         return float(value) if pd.notna(value) else None
     v135, v7, vdist = (num_or_none(latest.get(c)) for c in ("mq135", "mq7", "distance"))
     p135, p7, pdist = (num_or_none(previous.get(c)) for c in ("mq135", "mq7", "distance"))
-    kpi_card(c1, "mq135", "MQ-135 reading", v135 if v135 is not None else 0, "raw units*", (v135-p135) if v135 is not None and p135 is not None else float("nan"), "mq135", d, True) if v135 is not None else c1.metric("MQ-135 reading", "Unavailable")
-    kpi_card(c2, "mq7", "MQ-7 reading", v7 if v7 is not None else 0, "raw units*", (v7-p7) if v7 is not None and p7 is not None else float("nan"), "mq7", d, True) if v7 is not None else c2.metric("MQ-7 reading", "Unavailable")
-    kpi_card(c3, "dist", "Water distance", vdist if vdist is not None else 0, "cm", (vdist-pdist) if vdist is not None and pdist is not None else float("nan"), "distance", d, False) if vdist is not None else c3.metric("Water distance", "Unavailable")
+    # Use explicit if/else blocks. Bare function-call expressions can be rendered
+    # by Streamlit's magic and expose the implicit None return value as UI text.
+    if v135 is not None:
+        kpi_card(c1, "mq135", "MQ-135 reading", v135, "raw units*", (v135-p135) if p135 is not None else float("nan"), "mq135", d, True)
+    else:
+        c1.metric("MQ-135 reading", "Unavailable")
+
+    if v7 is not None:
+        kpi_card(c2, "mq7", "MQ-7 reading", v7, "raw units*", (v7-p7) if p7 is not None else float("nan"), "mq7", d, True)
+    else:
+        c2.metric("MQ-7 reading", "Unavailable")
+
+    if vdist is not None:
+        kpi_card(c3, "dist", "Water distance", vdist, "cm", (vdist-pdist) if pdist is not None else float("nan"), "distance", d, False)
+    else:
+        c3.metric("Water distance", "Unavailable")
     if not reading_valid:
         st.warning("Sensor data quality check failed. Do not interpret this reading as a safe environmental condition.")
-    # Count rows with at least one breach; null values do not count as valid passes.
+    
+       # Count rows with at least one breach; null values do not count as valid passes.
     breach = ((df["mq135"] > TH_MQ135) | (df["mq7"] > TH_MQ7) | (df["distance"] < TH_DIST)).fillna(False)
     with c4, st.container(border=True, key="card_count"):
         st.markdown(
@@ -428,4 +446,5 @@ with st.sidebar:
     st.markdown("---")
     st.caption("NODE NETWORK · TELEMETRY")
 
-st.fragment(run_every=REFRESH)(render)()
+_dashboard_fragment = st.fragment(run_every=REFRESH)(render)
+_dashboard_result = _dashboard_fragment()
