@@ -130,10 +130,22 @@ def reverse_geocode(lat: float, lon: float) -> str:
         return "Location lookup unavailable (coordinates are still shown)"
 
 
-def get_coordinate_columns(df: pd.DataFrame):
+# def get_coordinate_columns(df: pd.DataFrame):
     """Support either lat/lon or latitude/longitude column naming."""
     lat_col = "lat" if "lat" in df.columns else "latitude" if "latitude" in df.columns else None
     lon_col = "lon" if "lon" in df.columns else "longitude" if "longitude" in df.columns else None
+    return lat_col, lon_col
+
+def get_coordinate_columns(df: pd.DataFrame):
+    """Support common latitude and longitude column names."""
+    lat_col = next(
+        (c for c in ("lat", "latitude") if c in df.columns),
+        None
+    )
+    lon_col = next(
+        (c for c in ("lng", "lon", "longitude") if c in df.columns),
+        None
+    )
     return lat_col, lon_col
 
 
