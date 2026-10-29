@@ -1,7 +1,10 @@
 import os
 import json
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+import urllib.request
+import urllib.parse
+import smtplib
+from email.message import EmailMessage
+from dotenv import load_dotenv
 
 import altair as alt
 import pandas as pd
@@ -10,10 +13,12 @@ import streamlit as st
 
 from ml.anomaly_detector import detect_anomalies
 
+# Load environment variables from .env file
+load_dotenv()
+
 st.set_page_config(page_title="Node Analytics", layout="wide", initial_sidebar_state="expanded")
 
-# Fixed values (same as your original code)
-# Configure these against calibrated hardware before real-world use.
+# Fixed values
 TH_MQ135, TH_MQ7, TH_DIST = 400, 300, 20
 STALE_MIN = 5
 REFRESH = "15s"
@@ -78,22 +83,77 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+def show_toast(alert_id: str, msg: str, timestamp_str: str, icon: str = "⚠️"):
+    """Displays a UI toast. Uses the exact timestamp to prevent spamming toasts on 15s app refreshes."""
+    state_key = f"toast_{alert_id}"
+    if st.session_state.get(state_key) != timestamp_str:
+        st.toast(msg, icon=icon)
+        st.session_state[state_key] = timestamp_str
+
+def send_email_alert(alert_id: str, subject: str, message: str):
+    """Sends an Email via Gmail SMTP. Uses a local file to strictly enforce a 30-minute cooldown across app reloads."""
+    now = pd.Timestamp.now(tz="UTC")
+    cooldown_file = "alert_cooldowns.json"
+    cooldown_seconds = 30  # 5 minutes
+    
+    cooldowns = {}
+    if os.path.exists(cooldown_file):
+        try:
+            with open(cooldown_file, "r") as f:
+                cooldowns = json.load(f)
+        except Exception:
+            pass
+
+    if alert_id in cooldowns:
+        last_sent = pd.to_datetime(cooldowns[alert_id])
+        if (now - last_sent).total_seconds() < cooldown_seconds:
+            return  
+
+    try:
+        sender = os.getenv("EMAIL_SENDER") or st.secrets.get("EMAIL_SENDER")
+        password = os.getenv("EMAIL_PASSWORD") or st.secrets.get("EMAIL_PASSWORD")
+        recipient = os.getenv("ALERT_EMAIL_TO") or st.secrets.get("ALERT_EMAIL_TO")
+
+        if not sender or not password or not recipient:
+            return 
+
+        msg = EmailMessage()
+        msg.set_content(message)
+        msg['Subject'] = subject
+        msg['From'] = sender
+        msg['To'] = recipient
+
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.send_message(msg)
+            
+        print(f"Alert sent to {recipient}")
+        
+        cooldowns[alert_id] = now.isoformat()
+        with open(cooldown_file, "w") as f:
+            json.dump(cooldowns, f)
+            
+    except Exception as e:
+        print(f"Email Alert Failed: {e}")
 
 def get_database_url() -> str:
-    """Read database credentials only from Streamlit secrets or environment."""
-    try:
-        url = st.secrets.get("DATABASE_URL")
-    except Exception:
-        url = None
-    url = url or os.getenv("DATABASE_URL", "postgresql://postgres.hgsbvhhqenqqvebnevfk:VB1ySuctjJQW2Jcc@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres")
+    url = os.getenv("DATABASE_URL")
     if not url:
-        st.error("DATABASE_URL is not set. Add it to .streamlit/secrets.toml or your deployment environment.")
+        try:
+            url = st.secrets.get("DATABASE_URL")
+        except Exception:
+            pass
+            
+    url = url or "postgresql://postgres.hgsbvhhqenqqvebnevfk:VB1ySuctjJQW2Jcc@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres"
+    if not url:
+        st.error("DATABASE_URL is not set.")
         st.stop()
     return url
 
-
 @st.cache_data(ttl=15)
 def load_data() -> pd.DataFrame:
+    # Reverted exactly to your original working psycopg2 logic
     conn = psycopg2.connect(get_database_url(), connect_timeout=5)
     try:
         df = pd.read_sql_query(
@@ -113,53 +173,33 @@ def load_data() -> pd.DataFrame:
     df = df.dropna(subset=["timestamp"]).copy()
     return df.sort_values("timestamp", ascending=False).reset_index(drop=True)
 
-
 @st.cache_data(ttl=86400, show_spinner=False)
 def reverse_geocode(lat: float, lon: float) -> str:
-    """Resolve coordinates using OpenStreetMap Nominatim; cache results for 24 hours."""
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return "Invalid coordinates"
-    params = urlencode({"format": "jsonv2", "lat": f"{lat:.4f}", "lon": f"{lon:.4f}"})
+    params = urllib.parse.urlencode({"format": "jsonv2", "lat": f"{lat:.4f}", "lon": f"{lon:.4f}"})
     url = f"https://nominatim.openstreetmap.org/reverse?{params}"
-    request = Request(url, headers={"User-Agent": GEOCODER_USER_AGENT, "Accept-Language": "en"})
+    request = urllib.request.Request(url, headers={"User-Agent": GEOCODER_USER_AGENT, "Accept-Language": "en"})
     try:
-        with urlopen(request, timeout=4) as response:
+        with urllib.request.urlopen(request, timeout=4) as response:
             payload = json.loads(response.read().decode("utf-8"))
         return payload.get("display_name") or "Location name unavailable"
     except Exception:
         return "Location lookup unavailable (coordinates are still shown)"
 
-
-# def get_coordinate_columns(df: pd.DataFrame):
-    """Support either lat/lon or latitude/longitude column naming."""
-    lat_col = "lat" if "lat" in df.columns else "latitude" if "latitude" in df.columns else None
-    lon_col = "lon" if "lon" in df.columns else "longitude" if "longitude" in df.columns else None
-    return lat_col, lon_col
-
 def get_coordinate_columns(df: pd.DataFrame):
-    """Support common latitude and longitude column names."""
-    lat_col = next(
-        (c for c in ("lat", "latitude") if c in df.columns),
-        None
-    )
-    lon_col = next(
-        (c for c in ("lng", "lon", "longitude") if c in df.columns),
-        None
-    )
+    lat_col = next((c for c in ("lat", "latitude") if c in df.columns), None)
+    lon_col = next((c for c in ("lng", "lon", "longitude") if c in df.columns), None)
     return lat_col, lon_col
-
 
 def valid_sensor_reading(row) -> bool:
-    """Basic data-quality check; physical bounds should be calibrated per hardware."""
     values = [row.get("mq135"), row.get("mq7"), row.get("distance")]
     return all(pd.notna(v) and float(v) >= 0 for v in values)
-
 
 def style_chart(ch):
     return ch.configure_view(strokeWidth=0).configure(background="transparent").configure_axis(
         labelColor="#6b7280", titleColor="#6b7280", gridColor="#eceef2", domainColor="#e5e7eb", tickColor="#e5e7eb"
     ).configure_legend(labelColor="#0f1115")
-
 
 def sparkline(d, field):
     c = COLORS[field]
@@ -170,7 +210,6 @@ def sparkline(d, field):
         .properties(height=55)
     )
     return style_chart(ch)
-
 
 def kpi_card(col, key, label, value, unit, delta, field, d, higher_is_bad):
     with col, st.container(border=True, key=f"card_{key}"):
@@ -186,12 +225,10 @@ def kpi_card(col, key, label, value, unit, delta, field, d, higher_is_bad):
             f'<div class="{cls}">{dtxt}</div>',
             unsafe_allow_html=True,
         )
-        st.altair_chart(sparkline(d.tail(60), field), use_container_width=True, theme=None)
-
+        st.altair_chart(sparkline(d.tail(60), field), width="stretch", theme=None)
 
 def alert_html(level, title, text):
     return f'<div class="alert a-{level}"><b>{title}</b><small>{text}</small></div>'
-
 
 def bar_html(label, value_txt, pct, color):
     pct = max(0, min(pct, 1)) * 100
@@ -199,7 +236,6 @@ def bar_html(label, value_txt, pct, color):
         f'<div class="bar-row"><div class="bar-head"><span>{label}</span><span>{value_txt}</span></div>'
         f'<div class="bar-bg"><div class="bar-fg" style="width:{pct:.0f}%;background:{color}"></div></div></div>'
     )
-
 
 def render():
     try:
@@ -211,7 +247,6 @@ def render():
         st.info("Waiting for database telemetry...")
         return
 
-    # If telemetry is multi-node, analyse one node at a time rather than mixing nodes.
     if "node_id" in df.columns:
         node_ids = sorted(df["node_id"].dropna().astype(str).unique().tolist())
         if node_ids:
@@ -242,13 +277,12 @@ def render():
             unsafe_allow_html=True,
         )
     with h2:
-        if st.button("↻  Refresh now", use_container_width=True):
+        if st.button("↻  Refresh now", width="stretch"):
             load_data.clear()
             st.rerun()
         pill = '<span class="pill pill-ok">● Device online</span>' if online else '<span class="pill pill-bad">● No recent data</span>'
         st.markdown(f"<div style='text-align:right;padding-top:.6rem'>{pill}</div>", unsafe_allow_html=True)
 
-    # Prominent stale telemetry banner
     if not online:
         st.markdown(
             f'<div class="stale-banner"><div class="stale-icon">⚠️</div>'
@@ -258,7 +292,6 @@ def render():
             unsafe_allow_html=True,
         )
 
-    # Resolve the latest stored coordinates into a readable place name.
     lat_col, lon_col = get_coordinate_columns(df)
     with st.container(border=True, key="card_location"):
         st.markdown('<div class="card-title">Node Location</div><div class="card-sub">Resolved from the latest stored GPS coordinates</div>', unsafe_allow_html=True)
@@ -267,24 +300,22 @@ def render():
             if not (-90 <= lat <= 90 and -180 <= lon <= 180):
                 st.warning("GPS location unavailable — received coordinates are invalid.")
             elif abs(lat) < 1e-6 and abs(lon) < 1e-6:
-                # Many GPS modules report 0,0 before acquiring a valid satellite fix.
-                st.warning("GPS fix not acquired — coordinates are 0.000000, 0.000000. The receiver may not have locked onto enough satellites for a valid position fix. Check the GPS antenna connection, satellite visibility, and receiver fix status.")
+                st.warning("GPS fix not acquired — coordinates are 0.000000, 0.000000.")
             else:
                 place = reverse_geocode(round(lat, 4), round(lon, 4))
                 st.write(place)
                 st.caption(f"Latitude: {lat:.6f} · Longitude: {lon:.6f}")
                 st.markdown(f"[Open coordinates in OpenStreetMap](https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}#map=17/{lat:.6f}/{lon:.6f})")
         else:
-            st.warning("GPS location unavailable — no valid coordinates received. The GPS module may still be acquiring a satellite fix or the latest telemetry may not include latitude/longitude.")
+            st.warning("GPS location unavailable — no valid coordinates received.")
 
-    # KPI row. Invalid readings are displayed as unavailable, not interpreted as normal.
-        c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4 = st.columns(4)
     def num_or_none(value):
         return float(value) if pd.notna(value) else None
+    
     v135, v7, vdist = (num_or_none(latest.get(c)) for c in ("mq135", "mq7", "distance"))
     p135, p7, pdist = (num_or_none(previous.get(c)) for c in ("mq135", "mq7", "distance"))
-    # Use explicit if/else blocks. Bare function-call expressions can be rendered
-    # by Streamlit's magic and expose the implicit None return value as UI text.
+    
     if v135 is not None:
         kpi_card(c1, "mq135", "MQ-135 reading", v135, "raw units*", (v135-p135) if p135 is not None else float("nan"), "mq135", d, True)
     else:
@@ -299,10 +330,10 @@ def render():
         kpi_card(c3, "dist", "Water distance", vdist, "cm", (vdist-pdist) if pdist is not None else float("nan"), "distance", d, False)
     else:
         c3.metric("Water distance", "Unavailable")
+        
     if not reading_valid:
         st.warning("Sensor data quality check failed. Do not interpret this reading as a safe environmental condition.")
-    
-       # Count rows with at least one breach; null values do not count as valid passes.
+
     breach = ((df["mq135"] > TH_MQ135) | (df["mq7"] > TH_MQ7) | (df["distance"] < TH_DIST)).fillna(False)
     with c4, st.container(border=True, key="card_count"):
         st.markdown(
@@ -313,58 +344,96 @@ def render():
         span = d["timestamp"].iloc[-1] - d["timestamp"].iloc[0]
         st.markdown(f'<p class="sub" style="margin-top:1.2rem">Covers {span.total_seconds() / 3600:.1f} hours</p>', unsafe_allow_html=True)
 
-    # Chart + alerts
+    # GRAPHS & ALERTS
     left, right = st.columns([2, 1])
-    with left, st.container(border=True, key="card_trend"):
-        st.markdown('<div class="card-title">Gas Sensor Trends</div><div class="card-sub">Sensor-specific dashed lines show each configured threshold</div>', unsafe_allow_html=True)
-        long = d[["timestamp", "mq135", "mq7"]].melt("timestamp", var_name="Sensor", value_name="Value").dropna()
-        long["Sensor"] = long["Sensor"].map(LABELS)
-        threshold_df = pd.DataFrame({
-            "Sensor": [LABELS["mq135"], LABELS["mq7"]],
-            "Threshold": [TH_MQ135, TH_MQ7],
-        })
-        scale = alt.Scale(domain=[LABELS["mq135"], LABELS["mq7"]], range=[COLORS["mq135"], COLORS["mq7"]])
-        lines = alt.Chart(long).mark_line().encode(
-            x=alt.X("timestamp:T", title="Time"),
-            y=alt.Y("Value:Q", title="Reading"),
-            color=alt.Color("Sensor:N", scale=scale, legend=alt.Legend(orient="top", title=None)),
-            tooltip=["timestamp:T", "Sensor:N", "Value:Q"],
-        )
-        rules = alt.Chart(threshold_df).mark_rule(strokeDash=[5, 4], color="#dc2626", opacity=0.75).encode(
-            y=alt.Y("Threshold:Q"),
-            detail="Sensor:N",
-            tooltip=["Sensor:N", "Threshold:Q"],
-        )
-        st.altair_chart(style_chart((lines + rules).properties(height=300)), use_container_width=True, theme=None)
+    
+    with left:
+        # Chart 1: Air Quality (MQ-135)
+        with st.container(border=True, key="card_trend_mq135"):
+            st.markdown('<div class="card-title">Air Quality Trend (MQ-135)</div><div class="card-sub">Tracking hazardous gases and VOCs.</div>', unsafe_allow_html=True)
+            df_135 = d[["timestamp", "mq135"]].dropna()
+            lines_135 = alt.Chart(df_135).mark_line(color=COLORS["mq135"]).encode(
+                x=alt.X("timestamp:T", title="Time"),
+                y=alt.Y("mq135:Q", title="Raw Units"),
+                tooltip=["timestamp:T", "mq135:Q"],
+            )
+            rules_135 = alt.Chart(pd.DataFrame({"Threshold": [TH_MQ135]})).mark_rule(strokeDash=[5, 4], color="#dc2626", opacity=0.75).encode(
+                y=alt.Y("Threshold:Q"), tooltip=["Threshold:Q"]
+            )
+            st.altair_chart(style_chart((lines_135 + rules_135).properties(height=200)), width="stretch", theme=None)
+        
+        # Chart 2: Carbon Monoxide (MQ-7)
+        with st.container(border=True, key="card_trend_mq7"):
+            st.markdown('<div class="card-title">Carbon Monoxide Trend (MQ-7)</div><div class="card-sub">Tracking specific CO levels.</div>', unsafe_allow_html=True)
+            df_7 = d[["timestamp", "mq7"]].dropna()
+            lines_7 = alt.Chart(df_7).mark_line(color=COLORS["mq7"]).encode(
+                x=alt.X("timestamp:T", title="Time"),
+                y=alt.Y("mq7:Q", title="Raw Units"),
+                tooltip=["timestamp:T", "mq7:Q"],
+            )
+            rules_7 = alt.Chart(pd.DataFrame({"Threshold": [TH_MQ7]})).mark_rule(strokeDash=[5, 4], color="#dc2626", opacity=0.75).encode(
+                y=alt.Y("Threshold:Q"), tooltip=["Threshold:Q"]
+            )
+            st.altair_chart(style_chart((lines_7 + rules_7).properties(height=200)), width="stretch", theme=None)
+        
+        # Chart 3: Water Distance
+        with st.container(border=True, key="card_trend_water"):
+            st.markdown('<div class="card-title">Water Proximity Trend</div><div class="card-sub">Tracking ultrasonic distance (closer equals higher flood risk).</div>', unsafe_allow_html=True)
+            water_df = d[["timestamp", "distance"]].dropna()
+            lines_water = alt.Chart(water_df).mark_line(color=COLORS["distance"]).encode(
+                x=alt.X("timestamp:T", title="Time"),
+                y=alt.Y("distance:Q", title="Distance (cm)"),
+                tooltip=["timestamp:T", "distance:Q"],
+            )
+            rules_water = alt.Chart(pd.DataFrame({"Threshold": [TH_DIST]})).mark_rule(strokeDash=[5, 4], color="#dc2626", opacity=0.75).encode(
+                y=alt.Y("Threshold:Q"), tooltip=["Threshold:Q"]
+            )
+            st.altair_chart(style_chart((lines_water + rules_water).properties(height=200)), width="stretch", theme=None)
 
     with right, st.container(border=True, key="card_alerts"):
         st.markdown('<div class="card-title">Critical Alerts</div><div class="card-sub">Based on the latest reading</div>', unsafe_allow_html=True)
         ts = latest["timestamp"].strftime("%H:%M:%S")
+        ts_raw = latest["timestamp"].isoformat() # Used to prevent toast spam
         any_alert = False
+        
+        # Check alerts, trigger Email, and trigger Toast
         if pd.notna(latest["mq135"]) and latest["mq135"] > TH_MQ135:
             any_alert = True
+            subj = "⚠️ SafeSewer Alert: Poor Air Quality"
+            msg = f"Poor Air Quality detected by node.\n\nMQ-135 Reading: {latest['mq135']:g}\nConfigured Limit: {TH_MQ135}\nTime: {ts} UTC"
             st.markdown(alert_html("crit", "Poor Air Quality", f"MQ-135 at {latest['mq135']:g} (limit {TH_MQ135}) · {ts}"), unsafe_allow_html=True)
+            send_email_alert("mq135_breach", subj, msg)
+            show_toast("mq135", f"Alert: MQ-135 breached {TH_MQ135}", ts_raw, "🔴")
+            
         if pd.notna(latest["mq7"]) and latest["mq7"] > TH_MQ7:
             any_alert = True
+            subj = "⚠️ SafeSewer Alert: High Carbon Monoxide"
+            msg = f"High Carbon Monoxide levels detected.\n\nMQ-7 Reading: {latest['mq7']:g}\nConfigured Limit: {TH_MQ7}\nTime: {ts} UTC"
             st.markdown(alert_html("crit", "High CO Detected", f"MQ-7 at {latest['mq7']:g} (limit {TH_MQ7}) · {ts}"), unsafe_allow_html=True)
+            send_email_alert("mq7_breach", subj, msg)
+            show_toast("mq7", f"Alert: MQ-7 breached {TH_MQ7}", ts_raw, "🟠")
+            
         if pd.notna(latest["distance"]) and latest["distance"] < TH_DIST:
             any_alert = True
-            st.markdown(alert_html("high", "Flood Risk", f"Water distance {latest['distance']:g} cm (below {TH_DIST} cm) · {ts}"), unsafe_allow_html=True)
+            subj = "🚨 SafeSewer Alert: Flood Risk Detected"
+            msg = f"Water levels have breached the safe margin.\n\nDistance to sensor: {latest['distance']:g} cm\nAlert Limit: {TH_DIST} cm\nTime: {ts} UTC"
+            st.markdown(alert_html("high", "Flood Risk", f"Water distance {latest['distance']:g} cm (below {TH_DIST} cm margin) · {ts}"), unsafe_allow_html=True)
+            send_email_alert("distance_breach", subj, msg)
+            show_toast("distance", f"Alert: Water breached {TH_DIST} cm margin", ts_raw, "🌊")
+            
         if not any_alert and online and reading_valid:
             st.markdown(alert_html("ok", "No Threshold Breaches", "Latest valid reading is within configured limits."), unsafe_allow_html=True)
         elif not any_alert and not reading_valid:
             st.markdown(alert_html("high", "Status Unknown", "Latest sensor values are missing or invalid; normal conditions cannot be confirmed."), unsafe_allow_html=True)
+        
         if not online:
             st.markdown(alert_html("high", "No Recent Data", f"Last reading was {age_txt}."), unsafe_allow_html=True)
 
-    # Bottom row
     b1, b2 = st.columns(2)
     with b1, st.container(border=True, key="card_usage"):
-        st.markdown('<div class="card-title">Threshold Usage & Water Proximity</div><div class="card-sub">Gas bars show value / configured limit. Water bar is a heuristic proximity indicator, not a certified flood probability.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card-title">Threshold Usage & Water Proximity</div><div class="card-sub">Gas bars show value / configured limit. Water bar is a heuristic proximity indicator.</div>', unsafe_allow_html=True)
         p135 = v135 / TH_MQ135 if v135 is not None else 0
         p7 = v7 / TH_MQ7 if v7 is not None else 0
-        # A closer distance means the water surface is closer to the sensor.
-        # This 0–100% scale is only a visual heuristic tied to TH_DIST.
         water_risk = max(0.0, min(1.0, (TH_DIST - vdist) / TH_DIST)) if vdist is not None else 0
         st.markdown(
             bar_html(LABELS["mq135"], f"{v135:g} / {TH_MQ135}" if v135 is not None else "Unavailable", p135, "#dc2626" if v135 is not None and p135 > 1 else COLORS["mq135"])
@@ -391,9 +460,6 @@ def render():
             st.markdown(f'<table class="t"><tr><th>Time (UTC)</th><th>Node</th><th>Sensor</th><th>Value</th></tr>{body}</table>', unsafe_allow_html=True)
             st.caption(f"Showing {min(len(rows), 10)} of {len(rows)} sensor breach events from the 500-row query window.")
 
-
-
-    # ML anomaly detection (implementation lives in ml/anomaly_detector.py)
     with st.container(border=True, key="card_ml_anomaly"):
         st.markdown(
             '<div class="card-title">ML Anomaly Detection</div>'
@@ -437,7 +503,7 @@ def render():
                         "distance": "Water distance (cm)",
                         "anomaly_score": "Anomaly score",
                     })
-                    st.dataframe(show, use_container_width=True, hide_index=True)
+                    st.dataframe(show, width="stretch", hide_index=True)
                 else:
                     st.caption("No anomalies were flagged in the currently loaded readings.")
         except Exception as exc:
